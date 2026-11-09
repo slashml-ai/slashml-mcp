@@ -1,0 +1,77 @@
+{
+  "description": "SlashML (/ml) ambient lifecycle hooks for passive memory assimilation and pre-tool rule enforcement.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/slashml-mcp.js",
+              "--hook",
+              "--hook-event",
+              "UserPromptSubmit"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/slashml-mcp.js",
+              "--hook",
+              "--hook-event",
+              "PreToolUse"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/slashml-mcp.js",
+              "--hook",
+              "--hook-event",
+              "PostToolUse"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/slashml-mcp.js",
+              "--hook",
+              "--hook-event",
+              "Stop"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

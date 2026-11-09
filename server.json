@@ -1,0 +1,52 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.slashml-ai/ml-memory",
+  "title": "SlashML (/ml) Persistent Agent Memory & Code Localization",
+  "description": "Persistent conversational memory, behavioral code search, and bug localization for AI agents.",
+  "websiteUrl": "https://slashml.ai",
+  "version": "1.0.11",
+  "repository": {
+    "url": "https://github.com/slashml-ai/ml-memory",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@slashml/mcp",
+      "version": "1.0.11",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "SLASHML_API_KEY",
+          "description": "Your SlashML API key (sml_live_...) from https://app.slashml.ai",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "SLASHML_USER_ID",
+          "description": "Optional default user or workspace namespace",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    },
+    {
+      "registryType": "pypi",
+      "identifier": "slashml-memory",
+      "version": "1.0.11",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "SLASHML_API_KEY",
+          "description": "Your SlashML API key (sml_live_...) from https://app.slashml.ai",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

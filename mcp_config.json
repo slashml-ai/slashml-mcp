@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ml-memory": {
+      "command": "node",
+      "args": ["hooks/slashml-mcp.js"]
+    }
+  }
+}

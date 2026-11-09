@@ -1,0 +1,39 @@
+{
+  "name": "@slashml/mcp",
+  "version": "1.0.11",
+  "mcpName": "io.github.slashml-ai/ml-memory",
+  "description": "Official Model Context Protocol (MCP) server for SlashML (Claude Desktop, Claude Code, OpenAI Codex, Cursor, Windsurf, Cline, Zed)",
+  "license": "Apache-2.0",
+  "homepage": "https://slashml.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/slashml-ai/ml-memory.git",
+    "directory": "mcp"
+  },
+  "bin": {
+    "mcp": "./bin/slashml-mcp.js",
+    "slashml-mcp": "./bin/slashml-mcp.js",
+    "slashml-mcp-code": "./bin/slashml-mcp-code.js"
+  },
+  "files": [
+    "bin",
+    "server.json",
+    "smithery.yaml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "slashml",
+    "mcp",
+    "model-context-protocol",
+    "agent-memory",
+    "claude-code",
+    "claude-desktop",
+    "codex",
+    "cursor",
+    "windsurf"
+  ]
+}
