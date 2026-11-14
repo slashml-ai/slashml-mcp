@@ -13,12 +13,25 @@ startCommand:
         type: string
         description: Optional default user or workspace namespace
         default: default
+      slashmlAgentId:
+        type: string
+        description: Optional calling agent ID for per-agent read/write and redaction scoping (X-SlashML-Agent-Id)
+      slashmlRedactPolicy:
+        type: string
+        description: Optional redaction policy preset or bucket list (tier1_secrets, soc2_coding, gdpr, hipaa, enterprise_strict)
+      slashmlRedactScope:
+        type: string
+        description: Optional redaction scope (memorize_and_recall or recall_only)
   commandFunction:
     |-
     (config) => ({
-      command: 'node',
-      args: ['hooks/slashml-mcp.js'],
+      command: 'npx',
+      args: ['-y', '@slashml/mcp'],
       env: {
-        CLAUDE_PLUGIN_OPTION_API_KEY: config.slashmlApiKey
+        SLASHML_API_KEY: config.slashmlApiKey,
+        ...(config.slashmlUserId ? { SLASHML_USER_ID: config.slashmlUserId } : {}),
+        ...(config.slashmlAgentId ? { SLASHML_AGENT_ID: config.slashmlAgentId } : {}),
+        ...(config.slashmlRedactPolicy ? { SLASHML_REDACT_POLICY: config.slashmlRedactPolicy } : {}),
+        ...(config.slashmlRedactScope ? { SLASHML_REDACT_SCOPE: config.slashmlRedactScope } : {})
       }
     })

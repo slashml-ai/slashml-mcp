@@ -4,7 +4,7 @@
   "title": "SlashML (/ml) Persistent Agent Memory & Code Localization",
   "description": "Persistent conversational memory, behavioral code search, and bug localization for AI agents.",
   "websiteUrl": "https://slashml.ai",
-  "version": "1.0.11",
+  "version": "1.0.14",
   "repository": {
     "url": "https://github.com/slashml-ai/ml-memory",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "@slashml/mcp",
-      "version": "1.0.11",
+      "version": "1.0.14",
       "transport": {
         "type": "stdio"
       },
@@ -29,13 +29,31 @@
           "description": "Optional default user or workspace namespace",
           "isRequired": false,
           "isSecret": false
+        },
+        {
+          "name": "SLASHML_AGENT_ID",
+          "description": "Optional caller agent ID for per-agent read/write access and redaction policies",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SLASHML_REDACT_POLICY",
+          "description": "Optional default redaction preset or comma-separated sensitive buckets",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SLASHML_REDACT_SCOPE",
+          "description": "Optional redaction scope: memorize_and_recall or recall_only",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     },
     {
       "registryType": "pypi",
       "identifier": "slashml-memory",
-      "version": "1.0.11",
+      "version": "1.0.12",
       "transport": {
         "type": "stdio"
       },

@@ -9,17 +9,32 @@
  * API key is supplied via Claude Code userConfig (CLAUDE_PLUGIN_OPTION_API_KEY).
  */
 
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const readline = require("readline");
 
-const PACKAGE_VERSION = "1.0.11";
+const PACKAGE_VERSION = "1.0.14";
+const MAX_STOP_BLOCKS_PER_PROMPT = 3;
 const DEFAULT_BASE_URL = "https://api.slashml.ai";
 const DEFAULT_USER_ID = "default";
 
 function parseArgs(argv) {
   const out = {
-    apiKey: String(process.env.CLAUDE_PLUGIN_OPTION_API_KEY || "").trim(),
-    baseUrl: DEFAULT_BASE_URL,
-    userId: DEFAULT_USER_ID,
+    apiKey: String(
+      process.env.CLAUDE_PLUGIN_OPTION_API_KEY || process.env.SLASHML_API_KEY || ""
+    ).trim(),
+    baseUrl: String(process.env.SLASHML_BASE_URL || DEFAULT_BASE_URL).trim() || DEFAULT_BASE_URL,
+    userId: String(process.env.SLASHML_USER_ID || DEFAULT_USER_ID).trim() || DEFAULT_USER_ID,
+    agentId: String(
+      process.env.CLAUDE_PLUGIN_OPTION_AGENT_ID || process.env.SLASHML_AGENT_ID || ""
+    ).trim(),
+    redactPolicy: String(
+      process.env.CLAUDE_PLUGIN_OPTION_REDACT_POLICY || process.env.SLASHML_REDACT_POLICY || ""
+    ).trim(),
+    redactScope: String(
+      process.env.CLAUDE_PLUGIN_OPTION_REDACT_SCOPE || process.env.SLASHML_REDACT_SCOPE || ""
+    ).trim(),
     isHook: false,
     hookEvent: "",
   };
@@ -33,27 +48,40 @@ function parseArgs(argv) {
       out.isHook = true;
     } else if (arg === "--hook-event" && i + 1 < argv.length) {
       out.hookEvent = String(argv[++i] || "").trim();
+    } else if (arg === "--agent-id" && i + 1 < argv.length) {
+      out.agentId = String(argv[++i] || "").trim();
+    } else if (arg === "--redact-policy" && i + 1 < argv.length) {
+      out.redactPolicy = String(argv[++i] || "").trim();
+    } else if (arg === "--redact-scope" && i + 1 < argv.length) {
+      out.redactScope = String(argv[++i] || "").trim();
     }
   }
   return out;
 }
 
-async function apiRequest(opts, method, endpoint, body, timeoutMs = 15000) {
+async function apiRequest(opts, method, endpoint, body, timeoutMs = 15000, extraHeaders = null) {
   if (!opts.apiKey) {
     throw new Error(
       "Missing SlashML API key. Configure api_key in the plugin settings."
     );
+  }
+  const headers = {
+    Authorization: `Bearer ${opts.apiKey}`,
+    "Content-Type": "application/json",
+    "User-Agent": `slashml-claude-plugin/${PACKAGE_VERSION}`,
+  };
+  if (opts.agentId) {
+    headers["X-SlashML-Agent-Id"] = opts.agentId;
+  }
+  if (extraHeaders && typeof extraHeaders === "object") {
+    Object.assign(headers, extraHeaders);
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(`${opts.baseUrl}${endpoint}`, {
       method,
-      headers: {
-        Authorization: `Bearer ${opts.apiKey}`,
-        "Content-Type": "application/json",
-        "User-Agent": `slashml-claude-plugin/${PACKAGE_VERSION}`,
-      },
+      headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     });
@@ -124,7 +152,44 @@ async function runHookMode(opts) {
     opts.hookEvent || payload.hook_event_name || "UserPromptSubmit"
   ).trim();
 
-  if (hookEvent === "Stop" && (payload.stop_hook_active || payload.loop_count > 0)) {
+  if (hookEvent === "Stop" && Number(payload.loop_count || 0) >= MAX_STOP_BLOCKS_PER_PROMPT) {
+    process.stdout.write("{}\n");
+    return;
+  }
+
+  const statePath = path.join(os.homedir(), ".slashml", "plugin_hook_state.json");
+  let hookState = { stop_turn_by_session: {} };
+  try {
+    if (fs.existsSync(statePath)) {
+      const parsed = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      if (parsed && typeof parsed === "object" && parsed.stop_turn_by_session && typeof parsed.stop_turn_by_session === "object") {
+        hookState = parsed;
+      }
+    }
+  } catch {
+    hookState = { stop_turn_by_session: {} };
+  }
+  const sessionKey = String(payload.session_id || payload.conversation_id || opts.userId || "default").trim();
+  if (hookEvent === "UserPromptSubmit") {
+    if (hookState.stop_turn_by_session[sessionKey]) {
+      hookState.stop_turn_by_session[sessionKey] = { blocked_ids: [], retry_count: 0 };
+      try {
+        fs.mkdirSync(path.dirname(statePath), { recursive: true });
+        fs.writeFileSync(statePath, JSON.stringify(hookState), "utf8");
+      } catch {
+        // ignore state persistence errors
+      }
+    }
+  }
+  const stopTurnEntry =
+    (hookState.stop_turn_by_session[sessionKey] && typeof hookState.stop_turn_by_session[sessionKey] === "object")
+      ? hookState.stop_turn_by_session[sessionKey]
+      : { blocked_ids: [], retry_count: 0 };
+  const stopBlockedIds = Array.isArray(stopTurnEntry.blocked_ids)
+    ? stopTurnEntry.blocked_ids.map((x) => String(x || "").trim()).filter(Boolean)
+    : [];
+  const stopRetryCount = Math.max(0, Number(stopTurnEntry.retry_count || 0));
+  if (hookEvent === "Stop" && stopRetryCount >= MAX_STOP_BLOCKS_PER_PROMPT) {
     process.stdout.write("{}\n");
     return;
   }
@@ -186,7 +251,9 @@ async function runHookMode(opts) {
         ...(hookEvent === "Stop"
           ? {
               last_assistant_message: deltaText,
-              stop_hook_active: Boolean(payload.stop_hook_active),
+              stop_hook_active: Boolean(payload.stop_hook_active) || stopRetryCount > 0,
+              turn_blocked_memory_ids: stopBlockedIds,
+              stop_retry_count: stopRetryCount,
             }
           : {}),
         tool_name: toolName,
@@ -194,6 +261,9 @@ async function runHookMode(opts) {
         tool_response: payload.tool_response || null,
         commit_writes: true,
         user_id: opts.userId,
+        ...(opts.agentId ? { caller_agent_id: opts.agentId } : {}),
+        ...(opts.redactPolicy ? { redact_policy: opts.redactPolicy } : {}),
+        ...(opts.redactScope ? { redact_scope: opts.redactScope } : {}),
         ...(payload.session_id ? { session_id: String(payload.session_id) } : {}),
       },
       8000
@@ -244,6 +314,34 @@ async function runHookMode(opts) {
         resp.intervention_severity === "BLOCK" &&
         resp.intervention_message
       ) {
+        const newlyTriggered = Array.from(
+          new Set(
+            [
+              ...(Array.isArray(resp.violated_memory_ids) ? resp.violated_memory_ids : []),
+              ...(resp.violated_memory_id ? [resp.violated_memory_id] : []),
+              ...(Array.isArray(resp.triggered_memory_ids) ? resp.triggered_memory_ids : []),
+              ...(resp.triggered_memory_id ? [resp.triggered_memory_id] : []),
+            ]
+              .map((x) => String(x || "").trim())
+              .filter(Boolean)
+          )
+        );
+        const novelStopIds = newlyTriggered.filter((id) => !stopBlockedIds.includes(id));
+        if (newlyTriggered.length > 0 && novelStopIds.length === 0) {
+          process.stdout.write("{}\n");
+          return;
+        }
+        const mergedIds = Array.from(new Set([...stopBlockedIds, ...novelStopIds])).slice(-16);
+        hookState.stop_turn_by_session[sessionKey] = {
+          blocked_ids: mergedIds,
+          retry_count: stopRetryCount + 1,
+        };
+        try {
+          fs.mkdirSync(path.dirname(statePath), { recursive: true });
+          fs.writeFileSync(statePath, JSON.stringify(hookState), "utf8");
+        } catch {
+          // ignore state persistence errors
+        }
         process.stdout.write(
           JSON.stringify({
             decision: "block",
@@ -272,6 +370,9 @@ const STANDARD_TOOLS = [
         query: { type: "string" },
         user_id: { type: "string" },
         limit: { type: "integer", default: 5 },
+        caller_agent_id: { type: "string" },
+        redact_policy: { type: "string" },
+        redact_scope: { type: "string" },
       },
       required: ["query"],
     },
@@ -284,17 +385,22 @@ const STANDARD_TOOLS = [
       properties: {
         user_id: { type: "string" },
         limit: { type: "integer", default: 100 },
+        caller_agent_id: { type: "string" },
+        redact_policy: { type: "string" },
+        redact_scope: { type: "string" },
       },
     },
   },
   {
     name: "forget_memory",
-    description: "Delete a specific memory ID.",
+    description: "Delete or subject-purge a specific memory ID.",
     inputSchema: {
       type: "object",
       properties: {
         memory_id: { type: "string" },
         user_id: { type: "string" },
+        purge: { type: "boolean", default: false },
+        caller_agent_id: { type: "string" },
       },
       required: ["memory_id"],
     },
@@ -308,8 +414,24 @@ const STANDARD_TOOLS = [
         text: { type: "string" },
         user_id: { type: "string" },
         metadata: { type: "object" },
+        caller_agent_id: { type: "string" },
+        redact_policy: { type: "string" },
+        redact_scope: { type: "string" },
       },
       required: ["text"],
+    },
+  },
+  {
+    name: "redact_memory",
+    description: "Redact sensitive spans statelessly from text or in-place on a stored memory_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string" },
+        memory_id: { type: "string" },
+        redact_policy: { type: "string" },
+        caller_agent_id: { type: "string" },
+      },
     },
   },
   {
@@ -378,37 +500,99 @@ const STANDARD_TOOLS = [
 async function dispatchTool(opts, name, rawArgs) {
   const args = rawArgs || {};
   const uid = args.user_id || opts.userId;
+  const callerAgent = String(args.caller_agent_id || opts.agentId || "").trim();
+  const redactPol = String(
+    args.redact_policy || args.sanitize_policy || opts.redactPolicy || ""
+  ).trim();
+  const redactScp = String(
+    args.redact_scope || args.sanitize_scope || opts.redactScope || ""
+  ).trim();
+  const agentHeaders = callerAgent ? { "X-SlashML-Agent-Id": callerAgent } : null;
 
   if (name === "search_memories") {
-    return apiRequest(opts, "POST", "/v1/memories/search", {
-      query: String(args.query || ""),
-      user_id: uid,
-      limit: Number(args.limit ?? 5),
-    });
+    return apiRequest(
+      opts,
+      "POST",
+      "/v1/memories/search",
+      {
+        query: String(args.query || ""),
+        user_id: uid,
+        limit: Number(args.limit ?? 5),
+        ...(callerAgent ? { caller_agent_id: callerAgent } : {}),
+        ...(redactPol ? { redact_policy: redactPol } : {}),
+        ...(redactScp ? { redact_scope: redactScp } : {}),
+      },
+      15000,
+      agentHeaders
+    );
   }
   if (name === "get_memories") {
     const q = new URLSearchParams({
       user_id: uid,
       limit: String(args.limit ?? 100),
     });
-    return apiRequest(opts, "GET", `/v1/memories/?${q.toString()}`);
+    if (redactPol) q.set("redact_policy", redactPol);
+    if (redactScp) q.set("redact_scope", redactScp);
+    return apiRequest(opts, "GET", `/v1/memories/?${q.toString()}`, undefined, 15000, agentHeaders);
   }
   if (name === "forget_memory") {
+    if (args.purge) {
+      return apiRequest(
+        opts,
+        "POST",
+        "/v1/memory/purge",
+        {
+          memory_ids: [String(args.memory_id || "")],
+          user_id: uid,
+          ...(callerAgent ? { caller_agent_id: callerAgent } : {}),
+        },
+        15000,
+        agentHeaders
+      );
+    }
     const q = new URLSearchParams({ user_id: uid });
     return apiRequest(
       opts,
       "DELETE",
-      `/v1/memories/${encodeURIComponent(String(args.memory_id || ""))}/?${q.toString()}`
+      `/v1/memories/${encodeURIComponent(String(args.memory_id || ""))}/?${q.toString()}`,
+      undefined,
+      15000,
+      agentHeaders
     );
   }
   if (name === "add_memory") {
-    return apiRequest(opts, "POST", "/v1/memories/", {
-      messages: [{ role: "user", content: String(args.text || "") }],
-      user_id: uid,
-      ...(args.metadata && typeof args.metadata === "object"
-        ? { metadata: args.metadata }
-        : {}),
-    });
+    return apiRequest(
+      opts,
+      "POST",
+      "/v1/memories/",
+      {
+        messages: [{ role: "user", content: String(args.text || "") }],
+        user_id: uid,
+        ...(callerAgent ? { caller_agent_id: callerAgent } : {}),
+        ...(redactPol ? { redact_policy: redactPol } : {}),
+        ...(redactScp ? { redact_scope: redactScp } : {}),
+        ...(args.metadata && typeof args.metadata === "object"
+          ? { metadata: args.metadata }
+          : {}),
+      },
+      15000,
+      agentHeaders
+    );
+  }
+  if (name === "redact_memory" || name === "sanitize_memory") {
+    return apiRequest(
+      opts,
+      "POST",
+      "/v1/memory/redact",
+      {
+        ...(args.text !== undefined ? { text: String(args.text) } : {}),
+        ...(args.memory_id !== undefined ? { memory_id: String(args.memory_id) } : {}),
+        ...(redactPol ? { redact_policy: redactPol } : {}),
+        ...(callerAgent ? { caller_agent_id: callerAgent } : {}),
+      },
+      15000,
+      agentHeaders
+    );
   }
   if (name === "index_repository") {
     const files = Array.isArray(args.files) ? args.files : [];
