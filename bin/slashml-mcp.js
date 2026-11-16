@@ -10,7 +10,7 @@ const readline = require("readline");
 
 const DEFAULT_BASE_URL = "https://api.slashml.ai";
 const DEFAULT_CONSOLE_URL = "https://app.slashml.ai";
-const PACKAGE_VERSION = "1.0.14";
+const PACKAGE_VERSION = "1.0.15";
 const MAX_STOP_BLOCKS_PER_PROMPT = 3;
 
 function printHelp() {
@@ -198,6 +198,7 @@ function parseCliArgs(argv) {
   let verifyCode = null;
   let writeEnv = false;
   let isHook = false;
+  let isHookDaemon = false;
   let hookEvent = null;
   let isInstallHooks = false;
   let isStatus = false;
@@ -227,6 +228,8 @@ function parseCliArgs(argv) {
       isInit = true;
     } else if (arg === "--hook" || arg === "hook") {
       isHook = true;
+    } else if (arg === "--hook-daemon") {
+      isHookDaemon = true;
     } else if (arg === "--hook-event" && i + 1 < argv.length) {
       hookEvent = argv[++i];
     } else if (arg === "--install-hooks" || arg === "install-hooks") {
@@ -326,6 +329,7 @@ function parseCliArgs(argv) {
     verifyCode,
     writeEnv,
     isHook,
+    isHookDaemon,
     hookEvent,
     isInstallHooks,
     isStatus,
@@ -659,11 +663,64 @@ function upsertSlashmlRuleBlock(filePath, bodyText = AMBIENT_RULE_MARKDOWN) {
   return true;
 }
 
+function quoteHookShellArg(p) {
+  const s = String(p || "");
+  return /\s/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s;
+}
+
+function ensureHookLauncherInstalled(home) {
+  const launcherPath = path.join(home, ".slashml", "bin", "slashml-hook.js");
+  try {
+    fs.mkdirSync(path.dirname(launcherPath), { recursive: true });
+    const src = fs.readFileSync(__filename);
+    let needsWrite = true;
+    if (fs.existsSync(launcherPath)) {
+      try {
+        const existing = fs.readFileSync(launcherPath);
+        if (Buffer.compare(src, existing) === 0) {
+          needsWrite = false;
+        }
+      } catch {
+        needsWrite = true;
+      }
+    }
+    if (needsWrite) {
+      const tmpPath = `${launcherPath}.${process.pid}.tmp`;
+      fs.writeFileSync(tmpPath, src, { mode: 0o755 });
+      fs.chmodSync(tmpPath, 0o755);
+      fs.renameSync(tmpPath, launcherPath);
+    }
+    const nodeBin =
+      process.execPath && fs.existsSync(process.execPath) ? process.execPath : "node";
+    return {
+      nodeBin,
+      launcherPath,
+      hookCmd: `${quoteHookShellArg(nodeBin)} ${quoteHookShellArg(launcherPath)} --hook`,
+    };
+  } catch {
+    return {
+      nodeBin: "node",
+      launcherPath: __filename,
+      hookCmd: `${quoteHookShellArg(process.execPath || "node")} ${quoteHookShellArg(__filename)} --hook`,
+    };
+  }
+}
+
+function isSlashmlHookCommand(cmd) {
+  if (typeof cmd !== "string") return false;
+  return (
+    cmd.includes("@slashml/") ||
+    cmd.includes("slashml-mcp") ||
+    cmd.includes("slashml-hook.js") ||
+    cmd.includes("slashml.mcp_server")
+  );
+}
+
 function installAmbientHooks(apiKey, opts = {}) {
   const quiet = Boolean(opts && opts.quiet);
   const onlyIfDirExists = Boolean(opts && opts.onlyIfDirExists);
   const home = os.homedir();
-  const hookCmd = "npx -y @slashml/memory --hook";
+  const { nodeBin, launcherPath, hookCmd } = ensureHookLauncherInstalled(home);
 
   // 1. Claude Code (~/.claude/settings.json + ~/.claude/CLAUDE.md)
   const claudeDir = path.join(home, ".claude");
@@ -683,14 +740,32 @@ function installAmbientHooks(apiKey, opts = {}) {
     }
     let changed = false;
     for (const eventName of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"]) {
+      const targetEventCmd = `${hookCmd} --hook-event ${eventName}`;
       if (!quiet || !Array.isArray(settings.hooks[eventName]) || settings.hooks[eventName].length === 0) {
         settings.hooks[eventName] = [
           {
             matcher: ".*",
-            hooks: [{ type: "command", command: hookCmd, timeout: 10 }],
+            hooks: [{ type: "command", command: targetEventCmd, timeout: 30 }],
           },
         ];
         changed = true;
+      } else {
+        for (const group of settings.hooks[eventName]) {
+          if (group && Array.isArray(group.hooks)) {
+            for (const h of group.hooks) {
+              if (h && isSlashmlHookCommand(h.command)) {
+                if (typeof h.timeout !== "number" || h.timeout < 30) {
+                  h.timeout = 30;
+                  changed = true;
+                }
+                if (h.command.trim().startsWith("npx ")) {
+                  h.command = targetEventCmd;
+                  changed = true;
+                }
+              }
+            }
+          }
+        }
       }
     }
     if (apiKey && (!quiet || !settings.env || !settings.env.SLASHML_API_KEY)) {
@@ -781,30 +856,61 @@ function installAmbientHooks(apiKey, opts = {}) {
           UserPromptSubmit: [
             {
               matcher: ".*",
-              hooks: [{ type: "command", command: `${hookCmd} --hook-event UserPromptSubmit`, timeout: 10 }],
+              hooks: [{ type: "command", command: `${hookCmd} --hook-event UserPromptSubmit`, timeout: 30 }],
             },
           ],
           PreToolUse: [
             {
               matcher: ".*",
-              hooks: [{ type: "command", command: `${hookCmd} --hook-event PreToolUse`, timeout: 10 }],
+              hooks: [{ type: "command", command: `${hookCmd} --hook-event PreToolUse`, timeout: 30 }],
             },
           ],
           PostToolUse: [
             {
               matcher: ".*",
-              hooks: [{ type: "command", command: `${hookCmd} --hook-event PostToolUse`, timeout: 10 }],
+              hooks: [{ type: "command", command: `${hookCmd} --hook-event PostToolUse`, timeout: 30 }],
             },
           ],
           Stop: [
             {
               matcher: ".*",
-              hooks: [{ type: "command", command: `${hookCmd} --hook-event Stop`, timeout: 10 }],
+              hooks: [{ type: "command", command: `${hookCmd} --hook-event Stop`, timeout: 30 }],
             },
           ],
         },
       };
       fs.writeFileSync(codexHooksPath, JSON.stringify(codexHooks, null, 2) + "\n", "utf8");
+    } else {
+      try {
+        const codexCfg = JSON.parse(fs.readFileSync(codexHooksPath, "utf8"));
+        let codexChanged = false;
+        if (codexCfg && codexCfg.hooks && typeof codexCfg.hooks === "object") {
+          for (const eventName of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"]) {
+            const groups = codexCfg.hooks[eventName];
+            if (!Array.isArray(groups)) continue;
+            for (const group of groups) {
+              if (!group || !Array.isArray(group.hooks)) continue;
+              for (const h of group.hooks) {
+                if (h && isSlashmlHookCommand(h.command)) {
+                  if (typeof h.timeout !== "number" || h.timeout < 30) {
+                    h.timeout = 30;
+                    codexChanged = true;
+                  }
+                  if (h.command.trim().startsWith("npx ")) {
+                    h.command = `${hookCmd} --hook-event ${eventName}`;
+                    codexChanged = true;
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (codexChanged) {
+          fs.writeFileSync(codexHooksPath, JSON.stringify(codexCfg, null, 2) + "\n", "utf8");
+        }
+      } catch {
+        // ignore malformed codex hooks.json
+      }
     }
     try {
       upsertSlashmlRuleBlock(path.join(codexDir, "AGENTS.md"));
@@ -850,7 +956,7 @@ function installAmbientHooks(apiKey, opts = {}) {
             {
               type: "command",
               command: `${hookCmd} --hook-event PreInvocation`,
-              timeout: 10,
+              timeout: 30,
             },
           ],
           PreToolUse: [
@@ -860,7 +966,7 @@ function installAmbientHooks(apiKey, opts = {}) {
                 {
                   type: "command",
                   command: `${hookCmd} --hook-event PreToolUse`,
-                  timeout: 10,
+                  timeout: 30,
                 },
               ],
             },
@@ -872,7 +978,7 @@ function installAmbientHooks(apiKey, opts = {}) {
                 {
                   type: "command",
                   command: `${hookCmd} --hook-event PostToolUse`,
-                  timeout: 10,
+                  timeout: 30,
                 },
               ],
             },
@@ -881,12 +987,45 @@ function installAmbientHooks(apiKey, opts = {}) {
             {
               type: "command",
               command: `${hookCmd} --hook-event Stop`,
-              timeout: 10,
+              timeout: 30,
             },
           ],
         },
       };
       fs.writeFileSync(geminiHooksPath, JSON.stringify(geminiHooks, null, 2) + "\n", "utf8");
+    } else {
+      try {
+        const gemCfg = JSON.parse(fs.readFileSync(geminiHooksPath, "utf8"));
+        const rootObj = gemCfg && gemCfg["slashml-ambient-memory"];
+        let gemChanged = false;
+        if (rootObj && typeof rootObj === "object") {
+          for (const eventName of ["PreInvocation", "PreToolUse", "PostToolUse", "Stop"]) {
+            const entries = rootObj[eventName];
+            if (!Array.isArray(entries)) continue;
+            for (const item of entries) {
+              if (!item || typeof item !== "object") continue;
+              const leafList = Array.isArray(item.hooks) ? item.hooks : [item];
+              for (const h of leafList) {
+                if (h && isSlashmlHookCommand(h.command)) {
+                  if (typeof h.timeout !== "number" || h.timeout < 30) {
+                    h.timeout = 30;
+                    gemChanged = true;
+                  }
+                  if (h.command.trim().startsWith("npx ")) {
+                    h.command = `${hookCmd} --hook-event ${eventName}`;
+                    gemChanged = true;
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (gemChanged) {
+          fs.writeFileSync(geminiHooksPath, JSON.stringify(gemCfg, null, 2) + "\n", "utf8");
+        }
+      } catch {
+        // ignore malformed gemini hooks.json
+      }
     }
     const geminiPluginJsonPath = path.join(geminiPluginDir, "plugin.json");
     if (!fs.existsSync(geminiPluginJsonPath)) {
@@ -922,10 +1061,10 @@ function installAmbientHooks(apiKey, opts = {}) {
 
 function runHook(event, payload) {
   try {
-    const res = spawnSync("npx", ["-y", "@slashml/memory", "--hook", "--hook-event", event], {
+    const res = spawnSync(${JSON.stringify(nodeBin)}, [${JSON.stringify(launcherPath)}, "--hook", "--hook-event", event], {
       input: JSON.stringify({ hook_event_name: event, ...payload }),
       encoding: "utf8",
-      timeout: 8000,
+      timeout: 30000,
     });
     if (res.stdout && res.stdout.trim().startsWith("{")) {
       return JSON.parse(res.stdout.trim());
@@ -1018,7 +1157,7 @@ export default SlashMLMemoryPlugin;
       const hooksDir = path.join(hermesDir, "agent-hooks");
       fs.mkdirSync(hooksDir, { recursive: true });
       const scriptPath = path.join(hooksDir, "slashml-hook.sh");
-      const scriptBody = `#!/usr/bin/env bash\nexec npx -y @slashml/memory --hook --hook-event "\${1:-pre_tool_call}"\n`;
+      const scriptBody = `#!/usr/bin/env bash\nexec ${hookCmd} --hook-event "\${1:-pre_tool_call}"\n`;
       if (!quiet || !fs.existsSync(scriptPath)) {
         fs.writeFileSync(scriptPath, scriptBody, { encoding: "utf8", mode: 0o755 });
         fs.chmodSync(scriptPath, 0o755);
@@ -1062,16 +1201,16 @@ export default SlashMLMemoryPlugin;
           "hooks:",
           `  pre_llm_call:`,
           `    - command: "${scriptPath} pre_llm_call"`,
-          `      timeout: 10`,
+          `      timeout: 30`,
           `  pre_tool_call:`,
           `    - command: "${scriptPath} pre_tool_call"`,
-          `      timeout: 10`,
+          `      timeout: 30`,
           `  post_tool_call:`,
           `    - command: "${scriptPath} post_tool_call"`,
-          `      timeout: 10`,
+          `      timeout: 30`,
           `  post_llm_call:`,
           `    - command: "${scriptPath} post_llm_call"`,
-          `      timeout: 10`,
+          `      timeout: 30`,
         ].join("\n");
         yamlText = yamlText.trim() ? `${yamlText.replace(/\n*$/, "")}\n\n${hooksBlock}\n` : `${hooksBlock}\n`;
         fs.writeFileSync(configYamlPath, yamlText, "utf8");
@@ -1393,6 +1532,11 @@ function extractWhisperedContextFromCurrentTurn(transcriptPath) {
           if (matches) {
             for (const m of matches) ids.add(m);
           }
+          const ruleHeaderRe = /\[MEMORY (?:INTERVENTION|WHISPER|CONTEXT)\]:\s*\(([^,\s)]+)/gi;
+          let rm;
+          while ((rm = ruleHeaderRe.exec(content)) !== null) {
+            if (rm[1]) ids.add(rm[1].trim());
+          }
         }
       } catch {
         // ignore partial line at start of buffer
@@ -1565,7 +1709,6 @@ async function runAmbientHookMode(opts) {
     }
   }
 
-  // Enforce hard 3-retry safety ceiling locally if harness passes an explicit loop_count >= 3
   if (hookEvent === "Stop" && Number(payload.loop_count || 0) >= MAX_STOP_BLOCKS_PER_PROMPT) {
     writeDefaultHookOutput(isGeminiHook, rawEventName, isCursorHook);
     return;
@@ -1702,6 +1845,8 @@ async function runAmbientHookMode(opts) {
       .trim()
       .toLowerCase()
       .replace(/^\s*cd\s+[^&;]+(?:&&|;)\s*/, "")
+      .replace(/\b2>\s*\/dev\/null\b/g, " ")
+      .replace(/\b2>&1\b/g, " ")
       .trim();
     const isReadOnlyCmd =
       /^(ls\b|pwd\b|cat\s|head\s|tail\s|grep\s|rg\s|find\s|git\s+(status|log|diff|branch|show|worktree|rev-parse|remote|tag|describe)\b|which\s|whoami\b|stat\s|wc\s)/.test(
@@ -1763,12 +1908,37 @@ async function runAmbientHookMode(opts) {
     .slice(0, 1024);
 
   const whisperKey = sessionKey || scopeStateKey;
-  const isMidTurnContinuation =
-    rawEventName === "PreInvocation" &&
-    (Number(payload.invocationNum || 1) > 1 || Number(payload.executionNum || 1) > 1);
   if (!dedupState.stop_turn_by_session || typeof dedupState.stop_turn_by_session !== "object") {
     dedupState.stop_turn_by_session = {};
   }
+  const existingStopTurnPre =
+    whisperKey &&
+    dedupState.stop_turn_by_session[whisperKey] &&
+    typeof dedupState.stop_turn_by_session[whisperKey] === "object"
+      ? dedupState.stop_turn_by_session[whisperKey]
+      : null;
+  const isStopRetryContinuation = Boolean(
+    rawInput.includes("Stop hook blocked termination") ||
+      (rawEventName === "PreInvocation" &&
+        payload.invocationNum == null &&
+        payload.executionNum == null &&
+        existingStopTurnPre &&
+        existingStopTurnPre.awaiting_stop_retry &&
+        Date.now() - Number(existingStopTurnPre.blocked_at_ms || 0) < 120000)
+  );
+  if (rawEventName === "PreInvocation" && existingStopTurnPre && existingStopTurnPre.awaiting_stop_retry) {
+    existingStopTurnPre.awaiting_stop_retry = false;
+    try {
+      fs.mkdirSync(path.dirname(dedupPath), { recursive: true });
+      fs.writeFileSync(dedupPath, JSON.stringify(dedupState), "utf8");
+    } catch {
+      // ignore state persistence errors
+    }
+  }
+  const isMidTurnContinuation =
+    isStopRetryContinuation ||
+    (rawEventName === "PreInvocation" &&
+      (Number(payload.invocationNum || 1) > 1 || Number(payload.executionNum || 1) > 1));
   if (hookEvent === "UserPromptSubmit" && !isMidTurnContinuation && whisperKey) {
     const existingStopTurn = dedupState.stop_turn_by_session[whisperKey];
     if (
@@ -1811,7 +1981,6 @@ async function runAmbientHookMode(opts) {
     return;
   }
 
-  // Event deduplication (scoped to project/session/step and only persisted for non-actionable noise)
   const stepKey = String(
     payload.stepIdx ?? payload.invocationNum ?? payload.executionNum ?? ""
   );
@@ -1935,39 +2104,66 @@ async function runAmbientHookMode(opts) {
     delete dedupState.pending_tool_input_by_session[scopeStateKey];
   }
 
-  try {
-    const resp = await apiRequest(opts, "POST", "/v1/memory/intervene", {
-      hook_event_name: hookEvent,
-      prompt: payload.prompt || payload.lastUserInput || deltaText,
-      text: streamTextForIntervene,
-      ...(hookEvent === "Stop"
-        ? {
-            last_assistant_message: deltaText,
-            stop_hook_active: Boolean(payload.stop_hook_active),
-            turn_blocked_memory_ids: turnBlockedIds,
-            stop_retry_count: turnStopRetries,
-          }
-        : {}),
-      ...(isMidTurnContinuation ? { is_mid_turn_continuation: true } : {}),
-      tool_name: toolName,
-      tool_input: effectiveToolIn,
-      tool_response: payload.tool_response || payload.toolResponse || null,
-      whispered_memory_ids: whisperedMemoryIds,
-      ...(overriddenMemoryIds.length > 0 ? { overridden_memory_ids: overriddenMemoryIds } : {}),
-      commit_writes: isMidTurnContinuation ? false : true,
-      model: process.env.SLASHML_MODEL || undefined,
-      user_id: opts.userId,
-      ...(projectId ? { project_id: projectId } : {}),
-      session_id: whisperKey,
-      ...(opts.redactPolicy ? { redact_policy: opts.redactPolicy } : {}),
-      ...(opts.redactScope ? { redact_scope: opts.redactScope } : {}),
-      ...(opts.agentId ? { caller_agent_id: opts.agentId } : {}),
-      client_raw_tokens_delta: (telem.pending_raw_tokens_delta || 0) + strippedTokens,
-      client_dropped_tokens_delta: (telem.pending_dropped_tokens_delta || 0) + strippedTokens,
-      client_dropped_events_delta: telem.pending_dropped_events_delta || 0,
+  const interveneReqBody = {
+    hook_event_name: hookEvent,
+    prompt: payload.prompt || payload.lastUserInput || deltaText,
+    text: streamTextForIntervene,
+    ...(hookEvent === "Stop"
+      ? {
+          last_assistant_message: deltaText,
+          stop_hook_active: Boolean(payload.stop_hook_active),
+          turn_blocked_memory_ids: turnBlockedIds,
+          stop_retry_count: turnStopRetries,
+        }
+      : {}),
+    ...(isMidTurnContinuation ? { is_mid_turn_continuation: true } : {}),
+    tool_name: toolName,
+    tool_input: effectiveToolIn,
+    tool_response: payload.tool_response || payload.toolResponse || null,
+    whispered_memory_ids: whisperedMemoryIds,
+    ...(overriddenMemoryIds.length > 0 ? { overridden_memory_ids: overriddenMemoryIds } : {}),
+    commit_writes: isMidTurnContinuation ? false : true,
+    model: process.env.SLASHML_MODEL || undefined,
+    user_id: opts.userId,
+    ...(projectId ? { project_id: projectId } : {}),
+    session_id: whisperKey,
+    ...(opts.redactPolicy ? { redact_policy: opts.redactPolicy } : {}),
+    ...(opts.redactScope ? { redact_scope: opts.redactScope } : {}),
+    ...(opts.agentId ? { caller_agent_id: opts.agentId } : {}),
+    client_raw_tokens_delta: (telem.pending_raw_tokens_delta || 0) + strippedTokens,
+    client_dropped_tokens_delta: (telem.pending_dropped_tokens_delta || 0) + strippedTokens,
+    client_dropped_events_delta: telem.pending_dropped_events_delta || 0,
+  };
+
+  if (
+    hookEvent === "PostToolUse" &&
+    shouldUseHookDaemon(opts.baseUrl) &&
+    process.env.SLASHML_SYNC_POST_TOOL !== "1"
+  ) {
+    telem.pending_raw_tokens_delta = 0;
+    telem.pending_dropped_tokens_delta = 0;
+    telem.pending_dropped_events_delta = 0;
+    telem.conversation_tokens_processed = (telem.conversation_tokens_processed || 0) + rawEventTokens;
+    telem.events_processed = (telem.events_processed || 0) + 1;
+    saveHookTelemetry(telem);
+    try {
+      fs.mkdirSync(path.dirname(dedupPath), { recursive: true });
+      fs.writeFileSync(dedupPath, JSON.stringify(dedupState), "utf8");
+    } catch {
+      // ignore state persistence errors
+    }
+    writeDefaultHookOutput(isGeminiHook, rawEventName, isCursorHook);
+    await enqueueAsyncPostToolHook(opts, interveneReqBody, {
+      dedupPath,
+      rawEventTokens,
+      deltaText,
+      deltaHash,
     });
-    // Client-side per-memory Stop circuit breaker (defense-in-depth across server restarts/versions):
-    // at most 1 Stop block per memory_id per user prompt, and at most MAX_STOP_BLOCKS_PER_PROMPT total.
+    return;
+  }
+
+  try {
+    const resp = await hookApiRequest(opts, "POST", "/v1/memory/intervene", interveneReqBody);
     if (
       hookEvent === "Stop" &&
       resp &&
@@ -1994,12 +2190,19 @@ async function runAmbientHookMode(opts) {
         resp.intervention_severity = "NONE";
         resp.intervention_message = null;
         resp.hook_output = {};
+        if (whisperKey && dedupState.stop_turn_by_session[whisperKey]) {
+          dedupState.stop_turn_by_session[whisperKey].awaiting_stop_retry = false;
+        }
       } else if (whisperKey) {
         dedupState.stop_turn_by_session[whisperKey] = {
           blocked_ids: Array.from(new Set([...turnBlockedIds, ...novelStopIds])).slice(-16),
           retry_count: turnStopRetries + 1,
+          awaiting_stop_retry: true,
+          blocked_at_ms: Date.now(),
         };
       }
+    } else if (hookEvent === "Stop" && whisperKey && dedupState.stop_turn_by_session[whisperKey]) {
+      dedupState.stop_turn_by_session[whisperKey].awaiting_stop_retry = false;
     }
     telem.pending_raw_tokens_delta = 0;
     telem.pending_dropped_tokens_delta = 0;
@@ -3567,6 +3770,13 @@ if (parsed.isStatus) {
   return;
 }
 
+if (parsed.isHookDaemon) {
+  runHookDaemonServer()
+    .then(() => {})
+    .catch(() => process.exit(1));
+  return;
+}
+
 if (parsed.isHook) {
   runAmbientHookMode(parsed)
     .then(() => process.exit(process.exitCode || 0))
@@ -3756,6 +3966,420 @@ const CODE_MODE_TOOLS = [
     },
   },
 ];
+
+function getHookDaemonSocketPath() {
+  if (process.platform === "win32") return null;
+  if (process.env.SLASHML_DAEMON_SOCK) return process.env.SLASHML_DAEMON_SOCK;
+  if (process.env.SLASHML_HOOK_SOCKET) return process.env.SLASHML_HOOK_SOCKET;
+  const uidPart = typeof process.getuid === "function" ? String(process.getuid()) : "user";
+  const candidate = path.join(os.homedir(), ".slashml", "run", `hook-daemon-${uidPart}.sock`);
+  if (candidate.length <= 96) return candidate;
+  const crypto = require("crypto");
+  const digest = crypto.createHash("sha1").update(os.homedir()).digest("hex").slice(0, 12);
+  return path.join(os.tmpdir(), `slashml-hd-${digest}.sock`);
+}
+
+function shouldUseHookDaemon(baseUrl) {
+  if (process.platform === "win32") return false;
+  if (process.env.SLASHML_DISABLE_HOOK_DAEMON === "1") return false;
+  if (process.env.SLASHML_FORCE_HOOK_DAEMON === "1") return true;
+  const u = String(baseUrl || "");
+  if (u.includes("127.0.0.1") || u.includes("localhost")) return false;
+  return true;
+}
+
+function spawnHookDaemonDetached() {
+  try {
+    const { spawn } = require("child_process");
+    const child = spawn(process.execPath, [__filename, "--hook-daemon"], {
+      detached: true,
+      stdio: "ignore",
+      env: process.env,
+    });
+    child.unref();
+  } catch {
+    // ignore background daemon spawn failures
+  }
+}
+
+function sendUnixDaemonRequest(sockPath, payload, timeoutMs = 25000) {
+  const http = require("http");
+  return new Promise((resolve, reject) => {
+    const rawBody = JSON.stringify(payload);
+    const req = http.request(
+      {
+        socketPath: sockPath,
+        path: "/proxy",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(rawBody),
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(Buffer.from(c)));
+        res.on("end", () => {
+          try {
+            const parsedResp = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+            resolve({ httpStatus: res.statusCode || 200, data: parsedResp });
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }
+    );
+    req.on("timeout", () => {
+      req.destroy(new Error("Hook daemon request timed out"));
+    });
+    req.on("error", reject);
+    req.write(rawBody);
+    req.end();
+  });
+}
+
+async function enqueueAsyncPostToolHook(opts, body, meta) {
+  if (!opts.apiKey) return;
+  const sockPath = getHookDaemonSocketPath();
+  if (!sockPath) return;
+  const headers = {
+    Authorization: `Bearer ${opts.apiKey}`,
+    "Content-Type": "application/json",
+    "User-Agent": `slashml-cli-node/${PACKAGE_VERSION}`,
+  };
+  if (opts.agentId) {
+    headers["X-SlashML-Agent-Id"] = opts.agentId;
+  }
+  const reqPayload = {
+    method: "POST",
+    url: `${opts.baseUrl}/v1/memory/intervene`,
+    headers,
+    body,
+    fireAndForget: true,
+    meta: {
+      ...meta,
+      telemPath:
+        process.env.SLASHML_TELEMETRY_PATH ||
+        path.join(os.homedir(), ".slashml", "telemetry.json"),
+    },
+  };
+  try {
+    await sendUnixDaemonRequest(sockPath, reqPayload, 400);
+    return;
+  } catch {
+    spawnHookDaemonDetached();
+  }
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await new Promise((r) => setTimeout(r, 12));
+    if (!fs.existsSync(sockPath)) continue;
+    try {
+      await sendUnixDaemonRequest(sockPath, reqPayload, 400);
+      return;
+    } catch {
+      // retry briefly while daemon binds socket
+    }
+  }
+}
+
+async function hookApiRequest(opts, method, urlPath, body) {
+  if (!opts.apiKey) {
+    throw new Error(
+      "SlashML API key is required. Set SLASHML_API_KEY in your environment or pass --api-key."
+    );
+  }
+  const sockPath = getHookDaemonSocketPath();
+  if (sockPath && shouldUseHookDaemon(opts.baseUrl)) {
+    const headers = {
+      Authorization: `Bearer ${opts.apiKey}`,
+      "Content-Type": "application/json",
+      "User-Agent": `slashml-cli-node/${PACKAGE_VERSION}`,
+    };
+    if (opts.agentId) {
+      headers["X-SlashML-Agent-Id"] = opts.agentId;
+    }
+    try {
+      const { data } = await sendUnixDaemonRequest(
+        sockPath,
+        {
+          method,
+          url: `${opts.baseUrl}${urlPath}`,
+          headers,
+          body,
+          fireAndForget: false,
+        },
+        25000
+      );
+      if (data && typeof data.status === "number") {
+        const parsedBody = data.text ? JSON.parse(data.text) : {};
+        if (data.status < 200 || data.status >= 300) {
+          throw new Error(`SlashML Cloud API error (HTTP ${data.status}): ${data.text || ""}`);
+        }
+        return parsedBody;
+      }
+    } catch (err) {
+      if (err && String(err.message || "").startsWith("SlashML Cloud API error")) {
+        throw err;
+      }
+      spawnHookDaemonDetached();
+    }
+  }
+  return apiRequest(opts, method, urlPath, body);
+}
+
+async function runHookDaemonServer() {
+  const sockPath = getHookDaemonSocketPath();
+  if (!sockPath) return;
+  const http = require("http");
+  const https = require("https");
+  const net = require("net");
+
+  fs.mkdirSync(path.dirname(sockPath), { recursive: true });
+  if (fs.existsSync(sockPath)) {
+    const alive = await new Promise((resolve) => {
+      const probe = net.createConnection(sockPath);
+      probe.once("connect", () => {
+        probe.end();
+        resolve(true);
+      });
+      probe.once("error", () => resolve(false));
+    });
+    if (alive) {
+      process.exit(0);
+    }
+    try {
+      fs.unlinkSync(sockPath);
+    } catch {
+      // ignore stale socket removal race
+    }
+  }
+
+  const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 16 });
+  const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 16 });
+
+  function upstreamFetchViaAgent(method, targetUrl, headers, bodyObj, timeoutMs = 24000) {
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(targetUrl);
+      const isHttps = parsedUrl.protocol === "https:";
+      const mod = isHttps ? https : http;
+      const rawBody = bodyObj !== undefined ? JSON.stringify(bodyObj) : "";
+      const reqHeaders = { ...(headers || {}) };
+      if (rawBody) {
+        reqHeaders["Content-Length"] = Buffer.byteLength(rawBody);
+      }
+      const uReq = mod.request(
+        {
+          protocol: parsedUrl.protocol,
+          hostname: parsedUrl.hostname,
+          port: parsedUrl.port || (isHttps ? 443 : 80),
+          path: `${parsedUrl.pathname}${parsedUrl.search}`,
+          method: method || "POST",
+          headers: reqHeaders,
+          agent: isHttps ? httpsAgent : httpAgent,
+          timeout: timeoutMs,
+        },
+        (uRes) => {
+          const rChunks = [];
+          uRes.on("data", (c) => rChunks.push(Buffer.from(c)));
+          uRes.on("end", () => {
+            resolve({
+              status: uRes.statusCode || 200,
+              text: Buffer.concat(rChunks).toString("utf8"),
+            });
+          });
+        }
+      );
+      uReq.on("timeout", () => {
+        uReq.destroy(new Error("Upstream API timed out"));
+      });
+      uReq.on("error", reject);
+      if (rawBody) uReq.write(rawBody);
+      uReq.end();
+    });
+  }
+
+  if (process.env.SLASHML_FORCE_HOOK_DAEMON !== "1") {
+    try {
+      const warmUrl = new URL(`${DEFAULT_BASE_URL}/health`);
+      const warmReq = https.request(
+        {
+          hostname: warmUrl.hostname,
+          port: 443,
+          path: warmUrl.pathname,
+          method: "GET",
+          headers: { "User-Agent": `slashml-cli-node/${PACKAGE_VERSION}` },
+          agent: httpsAgent,
+          timeout: 5000,
+        },
+        (res) => res.resume()
+      );
+      warmReq.on("error", () => {});
+      warmReq.end();
+    } catch {
+      // ignore connection error
+    }
+  }
+
+  let idleTimer = null;
+  const idleLimitMs = Math.max(5000, Number(process.env.SLASHML_DAEMON_IDLE_MS || 900000));
+  function touchIdle(server) {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      try {
+        server.close();
+      } catch {}
+      try {
+        if (fs.existsSync(sockPath)) fs.unlinkSync(sockPath);
+      } catch {}
+      process.exit(0);
+    }, idleLimitMs);
+    if (typeof idleTimer.unref === "function") idleTimer.unref();
+  }
+
+  const server = http.createServer((req, res) => {
+    touchIdle(server);
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, version: PACKAGE_VERSION, pid: process.pid }));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/shutdown") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      setImmediate(() => {
+        try {
+          server.close();
+        } catch {}
+        try {
+          if (fs.existsSync(sockPath)) fs.unlinkSync(sockPath);
+        } catch {}
+        process.exit(0);
+      });
+      return;
+    }
+    if (req.method === "POST" && req.url === "/proxy") {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(Buffer.from(c)));
+      req.on("end", async () => {
+        let payload = {};
+        try {
+          payload = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+        if (payload.fireAndForget) {
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ queued: true }));
+          try {
+            const up = await upstreamFetchViaAgent(
+              payload.method || "POST",
+              payload.url,
+              payload.headers,
+              payload.body
+            );
+            if (up.status >= 200 && up.status < 300 && up.text && payload.meta) {
+              const respObj = JSON.parse(up.text);
+              const { dedupPath, telemPath, rawEventTokens, deltaText, deltaHash } = payload.meta;
+              if (telemPath) {
+                let tObj = {};
+                try {
+                  if (fs.existsSync(telemPath)) {
+                    tObj = JSON.parse(fs.readFileSync(telemPath, "utf8")) || {};
+                  }
+                } catch {}
+                if (respObj && (respObj.should_write || respObj.should_intervene)) {
+                  const spanTok = estimateTokens(respObj.extracted_write_span || deltaText || "");
+                  tObj.noise_tokens_filtered =
+                    (tObj.noise_tokens_filtered || 0) + Math.max(0, (rawEventTokens || 0) - spanTok);
+                  if (respObj.should_write) {
+                    tObj.memories_assimilated = (tObj.memories_assimilated || 0) + 1;
+                    if (respObj.write_novelty_action === "SUPERSEDES") {
+                      tObj.memories_superseded = (tObj.memories_superseded || 0) + 1;
+                    }
+                  }
+                } else {
+                  tObj.noise_tokens_filtered =
+                    (tObj.noise_tokens_filtered || 0) + (rawEventTokens || 0);
+                  tObj.events_filtered_noise = (tObj.events_filtered_noise || 0) + 1;
+                }
+                try {
+                  fs.mkdirSync(path.dirname(telemPath), { recursive: true });
+                  fs.writeFileSync(telemPath, JSON.stringify(tObj), "utf8");
+                } catch {}
+              }
+              if (dedupPath) {
+                let dObj = { hashes: [] };
+                try {
+                  if (fs.existsSync(dedupPath)) {
+                    dObj = JSON.parse(fs.readFileSync(dedupPath, "utf8")) || { hashes: [] };
+                  }
+                } catch {}
+                if (respObj && respObj.should_write) {
+                  dObj.hashes = [];
+                } else if (deltaHash) {
+                  dObj.hashes = [
+                    ...(Array.isArray(dObj.hashes) ? dObj.hashes.slice(-63) : []),
+                    deltaHash,
+                  ];
+                }
+                try {
+                  fs.mkdirSync(path.dirname(dedupPath), { recursive: true });
+                  fs.writeFileSync(dedupPath, JSON.stringify(dObj), "utf8");
+                } catch {}
+              }
+            }
+          } catch {
+            // fail-open on background PostToolUse errors
+          }
+          return;
+        }
+        try {
+          const up = await upstreamFetchViaAgent(
+            payload.method || "POST",
+            payload.url,
+            payload.headers,
+            payload.body
+          );
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(up));
+        } catch (err) {
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: String((err && err.message) || err) }));
+        }
+      });
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found" }));
+  });
+
+  const cleanup = () => {
+    try {
+      if (fs.existsSync(sockPath)) fs.unlinkSync(sockPath);
+    } catch {}
+  };
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(sockPath, () => {
+      try {
+        fs.chmodSync(sockPath, 0o600);
+      } catch {}
+      touchIdle(server);
+      resolve();
+    });
+  });
+}
 
 async function apiRequest(opts, method, urlPath, body) {
   if (!opts.apiKey) {

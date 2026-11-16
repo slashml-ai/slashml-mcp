@@ -1,6 +1,6 @@
 {
   "name": "@slashml/mcp",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "mcpName": "io.github.slashml-ai/ml-memory",
   "description": "Official Model Context Protocol (MCP) server for SlashML (Claude Desktop, Claude Code, OpenAI Codex, Cursor, Windsurf, Cline, Zed)",
   "license": "Apache-2.0",

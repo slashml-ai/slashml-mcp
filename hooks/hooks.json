@@ -14,7 +14,7 @@
               "--hook-event",
               "UserPromptSubmit"
             ],
-            "timeout": 10
+            "timeout": 30
           }
         ]
       }
@@ -32,7 +32,7 @@
               "--hook-event",
               "PreToolUse"
             ],
-            "timeout": 10
+            "timeout": 30
           }
         ]
       }
@@ -50,7 +50,7 @@
               "--hook-event",
               "PostToolUse"
             ],
-            "timeout": 10
+            "timeout": 30
           }
         ]
       }
@@ -68,7 +68,7 @@
               "--hook-event",
               "Stop"
             ],
-            "timeout": 10
+            "timeout": 30
           }
         ]
       }

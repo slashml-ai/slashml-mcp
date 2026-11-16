@@ -9,15 +9,45 @@
  * API key is supplied via Claude Code userConfig (CLAUDE_PLUGIN_OPTION_API_KEY).
  */
 
+const crypto = require("crypto");
+const http = require("http");
+const https = require("https");
+const { spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const readline = require("readline");
 
-const PACKAGE_VERSION = "1.0.14";
+const PACKAGE_VERSION = "1.0.15";
 const MAX_STOP_BLOCKS_PER_PROMPT = 3;
 const DEFAULT_BASE_URL = "https://api.slashml.ai";
 const DEFAULT_USER_ID = "default";
+const HOOK_DAEMON_IDLE_MS = 15 * 60 * 1000;
+
+function getPluginDaemonSocketPath() {
+  if (process.env.SLASHML_DAEMON_SOCK) {
+    return process.env.SLASHML_DAEMON_SOCK;
+  }
+  if (process.env.SLASHML_HOOK_SOCKET) {
+    return process.env.SLASHML_HOOK_SOCKET;
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+  const candidate = path.join(os.homedir(), ".slashml", "run", `plugin-hook-daemon-${uid}.sock`);
+  if (candidate.length <= 96) {
+    return candidate;
+  }
+  const hash = crypto.createHash("sha1").update(os.homedir()).digest("hex").slice(0, 10);
+  return path.join(os.tmpdir(), `slashml-plg-${uid}-${hash}.sock`);
+}
+
+function shouldUsePluginDaemon(baseUrl) {
+  if (process.platform === "win32") return false;
+  if (process.env.SLASHML_DISABLE_HOOK_DAEMON === "1") return false;
+  if (process.env.SLASHML_FORCE_HOOK_DAEMON === "1") return true;
+  const s = String(baseUrl || DEFAULT_BASE_URL);
+  if (s.includes("127.0.0.1") || s.includes("localhost")) return false;
+  return true;
+}
 
 function parseArgs(argv) {
   const out = {
@@ -36,6 +66,7 @@ function parseArgs(argv) {
       process.env.CLAUDE_PLUGIN_OPTION_REDACT_SCOPE || process.env.SLASHML_REDACT_SCOPE || ""
     ).trim(),
     isHook: false,
+    isHookDaemon: false,
     hookEvent: "",
   };
 
@@ -46,6 +77,8 @@ function parseArgs(argv) {
       process.exit(0);
     } else if (arg === "--hook") {
       out.isHook = true;
+    } else if (arg === "--hook-daemon") {
+      out.isHookDaemon = true;
     } else if (arg === "--hook-event" && i + 1 < argv.length) {
       out.hookEvent = String(argv[++i] || "").trim();
     } else if (arg === "--agent-id" && i + 1 < argv.length) {
@@ -59,49 +92,308 @@ function parseArgs(argv) {
   return out;
 }
 
-async function apiRequest(opts, method, endpoint, body, timeoutMs = 15000, extraHeaders = null) {
+const KEEP_ALIVE_HTTPS_AGENT = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 8,
+  maxFreeSockets: 4,
+});
+const KEEP_ALIVE_HTTP_AGENT = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 8,
+  maxFreeSockets: 4,
+});
+
+function directKeepAliveJsonRequest(opts, method, endpoint, body, timeoutMs = 30000, extraHeaders = null) {
+  return new Promise((resolve, reject) => {
+    if (!opts.apiKey) {
+      reject(new Error("Missing SlashML API key. Configure api_key in the plugin settings."));
+      return;
+    }
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(`${opts.baseUrl.replace(/\/+$/, "")}${endpoint}`);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    const isHttps = parsedUrl.protocol === "https:";
+    const transport = isHttps ? https : http;
+    const agent = isHttps ? KEEP_ALIVE_HTTPS_AGENT : KEEP_ALIVE_HTTP_AGENT;
+    const payloadStr = body !== undefined ? JSON.stringify(body) : "";
+    const headers = {
+      Authorization: `Bearer ${opts.apiKey}`,
+      "Content-Type": "application/json",
+      Connection: "keep-alive",
+      "User-Agent": `slashml-claude-plugin/${PACKAGE_VERSION}`,
+    };
+    if (opts.agentId) {
+      headers["X-SlashML-Agent-Id"] = opts.agentId;
+    }
+    if (extraHeaders && typeof extraHeaders === "object") {
+      Object.assign(headers, extraHeaders);
+    }
+    if (body !== undefined) {
+      headers["Content-Length"] = Buffer.byteLength(payloadStr);
+    }
+    const req = transport.request(
+      {
+        protocol: parsedUrl.protocol,
+        hostname: parsedUrl.hostname,
+        port: parsedUrl.port || (isHttps ? 443 : 80),
+        path: `${parsedUrl.pathname}${parsedUrl.search}`,
+        method,
+        headers,
+        agent,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          let data = {};
+          if (text) {
+            try {
+              data = JSON.parse(text);
+            } catch {
+              data = { detail: text };
+            }
+          }
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            const msg = (data && (data.detail || data.error || data.message)) || res.statusMessage || "Request failed";
+            reject(new Error(`HTTP ${res.statusCode}: ${typeof msg === "string" ? msg : JSON.stringify(msg)}`));
+            return;
+          }
+          resolve(data);
+        });
+      }
+    );
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
+    });
+    req.on("error", reject);
+    if (body !== undefined) {
+      req.write(payloadStr);
+    }
+    req.end();
+  });
+}
+
+function unixSocketPost(socketPath, routePath, payload, timeoutMs = 25000) {
+  return new Promise((resolve, reject) => {
+    const rawBody = JSON.stringify(payload || {});
+    const req = http.request(
+      {
+        socketPath,
+        path: routePath,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(rawBody),
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          let parsed = {};
+          try {
+            parsed = text ? JSON.parse(text) : {};
+          } catch {
+            parsed = { detail: text };
+          }
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(parsed);
+          } else {
+            reject(new Error(parsed.error || parsed.detail || `Daemon HTTP ${res.statusCode}`));
+          }
+        });
+      }
+    );
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error("Daemon socket timeout"));
+    });
+    req.on("error", reject);
+    req.write(rawBody);
+    req.end();
+  });
+}
+
+async function ensurePluginDaemonRunning(socketPath) {
+  try {
+    const pingRes = await unixSocketPost(socketPath, "/ping", {}, 250);
+    if (pingRes && pingRes.ok) return true;
+  } catch {
+    // spawn below
+  }
+  try {
+    fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+    const child = spawn(process.execPath, [__filename, "--hook-daemon"], {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, SLASHML_HOOK_SOCKET: socketPath },
+    });
+    child.unref();
+  } catch {
+    return false;
+  }
+  for (let i = 0; i < 12; i += 1) {
+    await new Promise((r) => setTimeout(r, 25));
+    try {
+      const pingRes = await unixSocketPost(socketPath, "/ping", {}, 200);
+      if (pingRes && pingRes.ok) return true;
+    } catch {
+      // wait
+    }
+  }
+  return false;
+}
+
+async function runPluginDaemonServer() {
+  const socketPath = getPluginDaemonSocketPath();
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+  if (fs.existsSync(socketPath)) {
+    try {
+      const pingRes = await unixSocketPost(socketPath, "/ping", {}, 200);
+      if (pingRes && pingRes.ok) return;
+    } catch {
+      // stale socket
+    }
+    try {
+      fs.unlinkSync(socketPath);
+    } catch {
+      // ignore
+    }
+  }
+  let idleTimer = null;
+  const server = http.createServer((req, res) => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      try {
+        server.close();
+        if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
+      } catch {}
+      process.exit(0);
+    }, HOOK_DAEMON_IDLE_MS);
+    if (idleTimer.unref) idleTimer.unref();
+
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      if (req.url === "/ping") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, pid: process.pid, version: PACKAGE_VERSION }));
+        return;
+      }
+      if (req.url === "/shutdown") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        setImmediate(() => {
+          try {
+            server.close();
+            if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
+          } catch {}
+          process.exit(0);
+        });
+        return;
+      }
+      let msg = {};
+      try {
+        msg = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON" }));
+        return;
+      }
+      const reqOpts = msg.opts || {};
+      const method = msg.method || "POST";
+      const endpoint = msg.endpoint || "/v1/memory/intervene";
+      const body = msg.body;
+      const timeoutMs = Number(msg.timeoutMs || 25000);
+      const extraHeaders = msg.extraHeaders || null;
+      if (req.url === "/async") {
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ queued: true }));
+        directKeepAliveJsonRequest(reqOpts, method, endpoint, body, timeoutMs, extraHeaders).catch(() => {});
+        return;
+      }
+      try {
+        const out = await directKeepAliveJsonRequest(reqOpts, method, endpoint, body, timeoutMs, extraHeaders);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(out || {}));
+      } catch (err) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: String((err && err.message) || err) }));
+      }
+    });
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => {
+      try {
+        fs.chmodSync(socketPath, 0o600);
+      } catch {}
+      resolve();
+    });
+  });
+  idleTimer = setTimeout(() => {
+    try {
+      server.close();
+      if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
+    } catch {}
+    process.exit(0);
+  }, HOOK_DAEMON_IDLE_MS);
+  if (idleTimer.unref) idleTimer.unref();
+
+  try {
+    const warmUrl = new URL(`${DEFAULT_BASE_URL}/health`);
+    if (warmUrl.protocol === "https:") {
+      const warmReq = https.request(
+        {
+          hostname: warmUrl.hostname,
+          port: warmUrl.port || 443,
+          path: warmUrl.pathname,
+          method: "GET",
+          agent: KEEP_ALIVE_HTTPS_AGENT,
+          headers: { Connection: "keep-alive" },
+        },
+        (r) => r.resume()
+      );
+      warmReq.setTimeout(4000, () => warmReq.destroy());
+      warmReq.on("error", () => {});
+      warmReq.end();
+    }
+  } catch {}
+
+  await new Promise(() => {});
+}
+
+async function apiRequest(opts, method, endpoint, body, timeoutMs = 30000, extraHeaders = null, asyncFireAndForget = false) {
   if (!opts.apiKey) {
     throw new Error(
       "Missing SlashML API key. Configure api_key in the plugin settings."
     );
   }
-  const headers = {
-    Authorization: `Bearer ${opts.apiKey}`,
-    "Content-Type": "application/json",
-    "User-Agent": `slashml-claude-plugin/${PACKAGE_VERSION}`,
-  };
-  if (opts.agentId) {
-    headers["X-SlashML-Agent-Id"] = opts.agentId;
-  }
-  if (extraHeaders && typeof extraHeaders === "object") {
-    Object.assign(headers, extraHeaders);
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(`${opts.baseUrl}${endpoint}`, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-    });
-    const text = await res.text();
-    let data = {};
-    if (text) {
+  if (shouldUsePluginDaemon(opts.baseUrl)) {
+    const socketPath = getPluginDaemonSocketPath();
+    const ok = await ensurePluginDaemonRunning(socketPath);
+    if (ok) {
       try {
-        data = JSON.parse(text);
+        return await unixSocketPost(
+          socketPath,
+          asyncFireAndForget ? "/async" : "/request",
+          { opts, method, endpoint, body, timeoutMs, extraHeaders },
+          asyncFireAndForget ? 1500 : timeoutMs
+        );
       } catch {
-        data = { detail: text };
+        // fallback to direct keep-alive request below
       }
     }
-    if (!res.ok) {
-      const msg = (data && (data.detail || data.error || data.message)) || res.statusText;
-      throw new Error(`HTTP ${res.status}: ${typeof msg === "string" ? msg : JSON.stringify(msg)}`);
-    }
-    return data;
-  } finally {
-    clearTimeout(timer);
   }
+  return directKeepAliveJsonRequest(opts, method, endpoint, body, timeoutMs, extraHeaders);
 }
 
 const HOOK_READ_ONLY_TOOLS = new Set([
@@ -148,9 +440,19 @@ async function runHookMode(opts) {
     return;
   }
 
-  const hookEvent = String(
+  const rawHookEvent = String(
     opts.hookEvent || payload.hook_event_name || "UserPromptSubmit"
   ).trim();
+  const hookEvent =
+    rawHookEvent === "PreInvocation"
+      ? "UserPromptSubmit"
+      : rawHookEvent === "BeforeTool"
+      ? "PreToolUse"
+      : rawHookEvent === "AfterTool"
+      ? "PostToolUse"
+      : rawHookEvent === "AfterAgent"
+      ? "Stop"
+      : rawHookEvent;
 
   if (hookEvent === "Stop" && Number(payload.loop_count || 0) >= MAX_STOP_BLOCKS_PER_PROMPT) {
     process.stdout.write("{}\n");
@@ -169,9 +471,26 @@ async function runHookMode(opts) {
   } catch {
     hookState = { stop_turn_by_session: {} };
   }
-  const sessionKey = String(payload.session_id || payload.conversation_id || opts.userId || "default").trim();
+  const sessionKey = String(payload.session_id || payload.conversation_id || payload.conversationId || opts.userId || "default").trim();
+  const prevStopEntry = hookState.stop_turn_by_session[sessionKey];
+  const isStopRetryPreInvocation = Boolean(
+    rawHookEvent === "PreInvocation" &&
+      payload.invocationNum == null &&
+      prevStopEntry &&
+      typeof prevStopEntry === "object" &&
+      prevStopEntry.awaiting_stop_retry &&
+      Date.now() - Number(prevStopEntry.blocked_at_ms || 0) < 120000
+  );
   if (hookEvent === "UserPromptSubmit") {
-    if (hookState.stop_turn_by_session[sessionKey]) {
+    if (isStopRetryPreInvocation && prevStopEntry) {
+      prevStopEntry.awaiting_stop_retry = false;
+      try {
+        fs.mkdirSync(path.dirname(statePath), { recursive: true });
+        fs.writeFileSync(statePath, JSON.stringify(hookState), "utf8");
+      } catch {
+        // ignore state persistence errors
+      }
+    } else if (hookState.stop_turn_by_session[sessionKey]) {
       hookState.stop_turn_by_session[sessionKey] = { blocked_ids: [], retry_count: 0 };
       try {
         fs.mkdirSync(path.dirname(statePath), { recursive: true });
@@ -215,6 +534,28 @@ async function runHookMode(opts) {
       JSON.stringify(toolInput)
     : "";
 
+  if (
+    (hookEvent === "PreToolUse" || hookEvent === "PostToolUse") &&
+    toolName &&
+    /^(bash|run_command|shell)$/i.test(toolName)
+  ) {
+    const cmdCheck = String(toolSummary || "")
+      .trim()
+      .toLowerCase()
+      .replace(/^\s*cd\s+[^&;]+(?:&&|;)\s*/, "")
+      .replace(/\b2>\s*\/dev\/null\b/g, " ")
+      .replace(/\b2>&1\b/g, " ")
+      .trim();
+    const isReadOnlyCmd =
+      /^(ls\b|pwd\b|cat\s|head\s|tail\s|grep\s|rg\s|find\s|git\s+(status|log|diff|branch|show|worktree|rev-parse|remote|tag|describe)\b|which\s|whoami\b|stat\s|wc\s)/.test(
+        cmdCheck
+      ) && !/[>]|(\brm\s|\bmv\s|\bcp\s|git\s+(push|commit)|\binstall\b)/.test(cmdCheck);
+    if (isReadOnlyCmd) {
+      process.stdout.write("{}\n");
+      return;
+    }
+  }
+
   let candidateText = "";
   if (hookEvent === "PreToolUse") {
     candidateText = String(toolSummary || "");
@@ -239,34 +580,52 @@ async function runHookMode(opts) {
     return;
   }
 
+  const interveneBody = {
+    hook_event_name: hookEvent,
+    prompt: payload.prompt || deltaText,
+    text: deltaText,
+    ...(hookEvent === "Stop"
+      ? {
+          last_assistant_message: deltaText,
+          stop_hook_active: Boolean(payload.stop_hook_active) || stopRetryCount > 0,
+          turn_blocked_memory_ids: stopBlockedIds,
+          stop_retry_count: stopRetryCount,
+        }
+      : {}),
+    tool_name: toolName,
+    tool_input: toolInput,
+    tool_response: payload.tool_response || null,
+    commit_writes: !isStopRetryPreInvocation,
+    user_id: opts.userId,
+    ...(opts.agentId ? { caller_agent_id: opts.agentId } : {}),
+    ...(opts.redactPolicy ? { redact_policy: opts.redactPolicy } : {}),
+    ...(opts.redactScope ? { redact_scope: opts.redactScope } : {}),
+    ...(payload.session_id ? { session_id: String(payload.session_id) } : {}),
+  };
+
+  if (
+    hookEvent === "PostToolUse" &&
+    process.env.SLASHML_SYNC_POST_HOOK !== "1" &&
+    shouldUsePluginDaemon(opts.baseUrl)
+  ) {
+    try {
+      const asyncRes = await apiRequest(opts, "POST", "/v1/memory/intervene", interveneBody, 1500, null, true);
+      if (asyncRes && asyncRes.queued) {
+        process.stdout.write("{}\n");
+        return;
+      }
+    } catch {
+      // fallback below
+    }
+  }
+
   try {
     const resp = await apiRequest(
       opts,
       "POST",
       "/v1/memory/intervene",
-      {
-        hook_event_name: hookEvent,
-        prompt: payload.prompt || deltaText,
-        text: deltaText,
-        ...(hookEvent === "Stop"
-          ? {
-              last_assistant_message: deltaText,
-              stop_hook_active: Boolean(payload.stop_hook_active) || stopRetryCount > 0,
-              turn_blocked_memory_ids: stopBlockedIds,
-              stop_retry_count: stopRetryCount,
-            }
-          : {}),
-        tool_name: toolName,
-        tool_input: toolInput,
-        tool_response: payload.tool_response || null,
-        commit_writes: true,
-        user_id: opts.userId,
-        ...(opts.agentId ? { caller_agent_id: opts.agentId } : {}),
-        ...(opts.redactPolicy ? { redact_policy: opts.redactPolicy } : {}),
-        ...(opts.redactScope ? { redact_scope: opts.redactScope } : {}),
-        ...(payload.session_id ? { session_id: String(payload.session_id) } : {}),
-      },
-      8000
+      interveneBody,
+      25000
     );
 
     if (hookEvent === "PreToolUse") {
@@ -335,6 +694,8 @@ async function runHookMode(opts) {
         hookState.stop_turn_by_session[sessionKey] = {
           blocked_ids: mergedIds,
           retry_count: stopRetryCount + 1,
+          awaiting_stop_retry: true,
+          blocked_at_ms: Date.now(),
         };
         try {
           fs.mkdirSync(path.dirname(statePath), { recursive: true });
@@ -646,7 +1007,11 @@ async function dispatchTool(opts, name, rawArgs) {
 
 const parsed = parseArgs(process.argv.slice(2));
 
-if (parsed.isHook) {
+if (parsed.isHookDaemon) {
+  runPluginDaemonServer()
+    .then(() => process.exit(0))
+    .catch(() => process.exit(0));
+} else if (parsed.isHook) {
   runHookMode(parsed)
     .then(() => process.exit(0))
     .catch(() => {

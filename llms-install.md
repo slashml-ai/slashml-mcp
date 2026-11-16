@@ -50,4 +50,4 @@ gemini extensions install https://github.com/slashml-ai/gemini-slashml-memory
 ```
 
 ## 4. Verification
-Run `npx -y @slashml/mcp --version` to verify the binary resolves cleanly (`1.0.14`), or check the Official MCP Registry listings `ai.slashml/ml-memory` and `ai.slashml/slashml-robotics`.
+Run `npx -y @slashml/mcp --version` to verify the binary resolves cleanly (`1.0.15`), or check the Official MCP Registry listings `ai.slashml/ml-memory` and `ai.slashml/slashml-robotics`.
