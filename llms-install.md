@@ -16,7 +16,7 @@ Add the following entry under `mcpServers`:
       "command": "npx",
       "args": [
         "-y",
-        "@slashml/mcp"
+        "@slashml/mcp@latest"
       ],
       "env": {
         "SLASHML_API_KEY": "YOUR_SLASHML_API_KEY",
@@ -31,7 +31,7 @@ Add the following entry under `mcpServers`:
 ## 2. Claude Code CLI One-Liner (Local Stdio or Remote Streamable HTTP)
 ```bash
 # Option A: Local stdio server
-claude mcp add --scope user ml-memory -- env SLASHML_API_KEY=YOUR_SLASHML_API_KEY npx -y @slashml/mcp
+claude mcp add --scope user ml-memory -- env SLASHML_API_KEY=YOUR_SLASHML_API_KEY npx -y @slashml/mcp@latest
 
 # Option B: Remote Streamable HTTP server (1-click OAuth 2.1 at https://app.slashml.ai/oauth/authorize)
 claude mcp add --transport http --scope user ml-memory https://api.slashml.ai/mcp
@@ -45,9 +45,9 @@ claude mcp add --transport http --scope user slashml-robotics https://api.slashm
 ## 3. OpenAI Codex CLI, Gemini CLI & Portable Agent Skills
 ```bash
 npx skills add slashml-ai/ml-memory --skill slashml-memory
-codex mcp add ml-memory -- npx -y @slashml/mcp
+codex mcp add ml-memory -- npx -y @slashml/mcp@latest
 gemini extensions install https://github.com/slashml-ai/gemini-slashml-memory
 ```
 
 ## 4. Verification
-Run `npx -y @slashml/mcp --version` to verify the binary resolves cleanly (`1.0.15`), or check the Official MCP Registry listings `ai.slashml/ml-memory` and `ai.slashml/slashml-robotics`.
+Run `npx -y @slashml/mcp@latest --version` to verify the binary resolves cleanly (`1.0.16`), or check the Official MCP Registry listings `ai.slashml/ml-memory` and `ai.slashml/slashml-robotics`.

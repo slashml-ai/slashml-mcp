@@ -10,7 +10,7 @@ const readline = require("readline");
 
 const DEFAULT_BASE_URL = "https://api.slashml.ai";
 const DEFAULT_CONSOLE_URL = "https://app.slashml.ai";
-const PACKAGE_VERSION = "1.0.15";
+const PACKAGE_VERSION = "1.0.16";
 const MAX_STOP_BLOCKS_PER_PROMPT = 3;
 
 function printHelp() {
@@ -18,12 +18,12 @@ function printHelp() {
 Publisher: SlashML (https://slashml.ai)
 
 Usage:
-  npx -y @slashml/memory [options]
+  npx -y @slashml/memory@latest [options]
 
 When invoked without CLI flags, starts the JSON-RPC 2.0 MCP server over stdio.
 
 Claude Code Registration (User Scope):
-  claude mcp add --scope user ml-memory -e SLASHML_API_KEY="$SLASHML_API_KEY" -- npx -y @slashml/memory
+  claude mcp add --scope user ml-memory -e SLASHML_API_KEY="$SLASHML_API_KEY" -- npx -y @slashml/memory@latest
 
 Options:
   -h, --help                     Show this help message and exit
@@ -408,7 +408,7 @@ function nativeNodeInit(skill, apiKey, repo = null, writeEnv = false, extraEnv =
     return t.toLowerCase().includes(normalizedSkill);
   });
 
-  const args = ["-y", "@slashml/mcp"];
+  const args = ["-y", "@slashml/mcp@latest"];
   if (repo) {
     args.push("--workspace", repo);
   }
@@ -1135,7 +1135,7 @@ export default SlashMLMemoryPlugin;
         if (!quiet || !opencodeCfg.mcp["ml-memory"]) {
           opencodeCfg.mcp["ml-memory"] = {
             type: "local",
-            command: ["npx", "-y", "@slashml/mcp"],
+            command: ["npx", "-y", "@slashml/mcp@latest"],
             enabled: true,
             ...(apiKey ? { environment: { SLASHML_API_KEY: apiKey } } : {}),
           };

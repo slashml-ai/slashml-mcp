@@ -6,7 +6,7 @@ Official Model Context Protocol (MCP) server for **SlashML (`/` `ml`)**. Connect
 
 ### Claude Code (1-liner)
 ```bash
-claude mcp add --scope user ml-memory -- env SLASHML_API_KEY=sml_live_xxx npx -y @slashml/mcp
+claude mcp add --scope user ml-memory -- env SLASHML_API_KEY=sml_live_xxx npx -y @slashml/mcp@latest
 ```
 
 ### Cursor / Claude Desktop / Windsurf (`mcp.json`)
@@ -15,7 +15,7 @@ claude mcp add --scope user ml-memory -- env SLASHML_API_KEY=sml_live_xxx npx -y
   "mcpServers": {
     "ml-memory": {
       "command": "npx",
-      "args": ["-y", "@slashml/mcp"],
+      "args": ["-y", "@slashml/mcp@latest"],
       "env": {
         "SLASHML_API_KEY": "sml_live_xxx"
       }
@@ -27,13 +27,13 @@ claude mcp add --scope user ml-memory -- env SLASHML_API_KEY=sml_live_xxx npx -y
 ### Code Mode
 Expose a single `execute_memory_code` meta-tool:
 ```bash
-claude mcp add --scope user ml-memory-code -- env SLASHML_API_KEY=sml_live_xxx npx -y @slashml/mcp --code-mode
+claude mcp add --scope user ml-memory-code -- env SLASHML_API_KEY=sml_live_xxx npx -y @slashml/mcp@latest --code-mode
 ```
 
 ### Ambient Lifecycle Hooks
 Register `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop` hooks in `~/.claude/settings.json`:
 ```bash
-npx -y @slashml/mcp --install-hooks --api-key "$SLASHML_API_KEY"
+npx -y @slashml/mcp@latest --install-hooks --api-key "$SLASHML_API_KEY"
 ```
 
 ## Available Tools (Standard Mode)
